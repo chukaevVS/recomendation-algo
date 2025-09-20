@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.recommendation_system import RecommendationSystemDB, create_db_system
 from src.api.flask_api import RecommendationAPIDB
+from config import get_config, SystemConfig
 
 
 def main():
@@ -40,41 +41,54 @@ def main():
 
   # Запуск в режиме отладки
   python app.py --debug
+
+  # Запуск в production режиме
+  ENVIRONMENT=production python app.py
+
+  # Показать текущую конфигурацию
+  python app.py --show-config
         """
     )
     
     parser.add_argument(
         '--mode',
-        choices=['api', 'demo'],
+        choices=['api', 'demo', 'config'],
         default='api',
-        help='Режим запуска: api (сервер) или demo (демонстрация)'
+        help='Режим запуска: api (сервер), demo (демонстрация) или config (показать конфигурацию)'
+    )
+    
+    parser.add_argument(
+        '--environment',
+        choices=['development', 'staging', 'production'],
+        default=None,
+        help='Окружение для загрузки конфигурации (development, staging, production)'
     )
     
     parser.add_argument(
         '--database',
         type=str,
         default=None,
-        help='URL базы данных (по умолчанию: SQLite в data/recommendations.db)'
+        help='URL базы данных (переопределяет конфигурацию)'
     )
     
     parser.add_argument(
         '--host',
         type=str,
-        default='0.0.0.0',
-        help='Хост для API сервера (по умолчанию: 0.0.0.0)'
+        default=None,
+        help='Хост для API сервера (переопределяет конфигурацию)'
     )
     
     parser.add_argument(
         '--port',
         type=int,
-        default=3002,
-        help='Порт для API сервера (по умолчанию: 3002)'
+        default=None,
+        help='Порт для API сервера (переопределяет конфигурацию)'
     )
     
     parser.add_argument(
         '--debug',
         action='store_true',
-        help='Запуск в режиме отладки'
+        help='Запуск в режиме отладки (переопределяет конфигурацию)'
     )
     
     parser.add_argument(
@@ -86,45 +100,91 @@ def main():
     parser.add_argument(
         '--approach',
         choices=['user_based', 'item_based'],
-        default='user_based',
-        help='Подход к рекомендациям (по умолчанию: user_based)'
+        default=None,
+        help='Подход к рекомендациям (переопределяет конфигурацию)'
     )
     
     parser.add_argument(
         '--neighbors',
         type=int,
-        default=15,
-        help='Количество ближайших соседей для k-NN (по умолчанию: 15)'
+        default=None,
+        help='Количество ближайших соседей для k-NN (переопределяет конфигурацию)'
+    )
+    
+    parser.add_argument(
+        '--show-config',
+        action='store_true',
+        help='Показать текущую конфигурацию и выйти'
     )
     
     args = parser.parse_args()
     
+    # Загружаем конфигурацию
+    config = get_config(args.environment)
+    
+    # Переопределяем настройки из аргументов командной строки
+    if args.database:
+        config.database.url = args.database
+    if args.host:
+        config.api.host = args.host
+    if args.port:
+        config.api.port = args.port
+    if args.debug:
+        config.api.debug = True
+    if args.approach:
+        config.recommendation.approach = args.approach
+    if args.neighbors:
+        config.recommendation.n_neighbors = args.neighbors
+    if args.no_auto_load:
+        config.recommendation.auto_load = False
+    
+    # Валидируем конфигурацию
+    config.validate()
+    
     print("🚀 РЕКОМЕНДАТЕЛЬНАЯ СИСТЕМА")
     print("=" * 50)
     print(f"Режим: {args.mode}")
-    print(f"База данных: {args.database or 'SQLite (data/recommendations.db)'}")
-    print(f"Подход: {args.approach}")
-    print(f"Соседей: {args.neighbors}")
+    print(f"Окружение: {config.environment}")
+    print(f"База данных: {config.database.url}")
+    print(f"API: {config.api.host}:{config.api.port}")
+    print(f"Подход: {config.recommendation.approach}")
+    print(f"Соседей: {config.recommendation.n_neighbors}")
+    print(f"Автозагрузка: {config.recommendation.auto_load}")
     print("=" * 50)
     
+    if args.show_config or args.mode == 'config':
+        show_config(config)
+        return
+    
     if args.mode == 'api':
-        run_api_server(args)
+        run_api_server(config)
     elif args.mode == 'demo':
-        run_demo(args)
+        run_demo(config)
 
 
-def run_api_server(args):
+def show_config(config: SystemConfig):
+    """Показывает текущую конфигурацию."""
+    print("🔧 ТЕКУЩАЯ КОНФИГУРАЦИЯ")
+    print("=" * 50)
+    
+    import json
+    config_dict = config.to_dict()
+    print(json.dumps(config_dict, indent=2, ensure_ascii=False))
+
+
+def run_api_server(config: SystemConfig):
     """Запускает API сервер."""
     try:
         print("🏗️ Создание рекомендательной системы...")
         
         # Создаем систему с автоматической загрузкой данных
-        auto_load = not args.no_auto_load
         system = RecommendationSystemDB(
-            database_url=args.database,
-            approach=args.approach,
-            n_neighbors=args.neighbors,
-            auto_load=auto_load
+            database_url=config.database.url,
+            approach=config.recommendation.approach,
+            n_neighbors=config.recommendation.n_neighbors,
+            metric=config.recommendation.metric,
+            min_ratings=config.recommendation.min_ratings,
+            auto_load=config.recommendation.auto_load
         )
         
         print("🌐 Создание API сервера...")
@@ -140,37 +200,38 @@ def run_api_server(args):
         print(f"  - Рейтингов: {stats.get('n_ratings', 0)}")
         print(f"  - Модель обучена: {stats.get('model_trained', False)}")
         
-        print(f"\n🌐 Запуск API сервера на {args.host}:{args.port}")
-        print(f"📖 Документация: http://{args.host}:{args.port}/")
-        print(f"❤️  Health check: http://{args.host}:{args.port}/health")
-        print(f"📊 Статистика: http://{args.host}:{args.port}/stats")
+        print(f"\n🌐 Запуск API сервера на {config.api.host}:{config.api.port}")
+        print(f"📖 Документация: http://{config.api.host}:{config.api.port}/")
+        print(f"❤️  Health check: http://{config.api.host}:{config.api.port}/health")
+        print(f"📊 Статистика: http://{config.api.host}:{config.api.port}/stats")
         
         # Запускаем сервер
-        api.run(host=args.host, port=args.port, debug=args.debug)
+        api.run(host=config.api.host, port=config.api.port, debug=config.api.debug)
         
     except KeyboardInterrupt:
         print("\n👋 Сервер остановлен пользователем")
     except Exception as e:
         print(f"❌ Ошибка при запуске сервера: {e}")
-        if args.debug:
+        if config.api.debug:
             import traceback
             traceback.print_exc()
         sys.exit(1)
 
 
-def run_demo(args):
+def run_demo(config: SystemConfig):
     """Запускает демонстрацию системы."""
     try:
         print("🎯 ДЕМОНСТРАЦИЯ РЕКОМЕНДАТЕЛЬНОЙ СИСТЕМЫ")
         print("=" * 50)
         
         # Создаем систему
-        auto_load = not args.no_auto_load
         system = RecommendationSystemDB(
-            database_url=args.database,
-            approach=args.approach,
-            n_neighbors=args.neighbors,
-            auto_load=auto_load
+            database_url=config.database.url,
+            approach=config.recommendation.approach,
+            n_neighbors=config.recommendation.n_neighbors,
+            metric=config.recommendation.metric,
+            min_ratings=config.recommendation.min_ratings,
+            auto_load=config.recommendation.auto_load
         )
         
         # Выводим статистику
@@ -210,7 +271,7 @@ def run_demo(args):
         
     except Exception as e:
         print(f"❌ Ошибка при демонстрации: {e}")
-        if args.debug:
+        if config.api.debug:
             import traceback
             traceback.print_exc()
         sys.exit(1)
