@@ -1,8 +1,7 @@
 """
-Основной класс рекомендательной системы для интернет-магазина.
+Рекомендательная система с поддержкой базы данных.
 
-Этот модуль объединяет все компоненты системы и предоставляет
-единый интерфейс для работы с рекомендациями.
+Интегрирует базу данных с системой рекомендаций.
 """
 
 import pandas as pd
@@ -16,35 +15,38 @@ try:
     # Относительные импорты для использования как пакета
     from .models.data_models import DataManager, User, Product, Rating
     from .algorithms.knn_recommender import KNNRecommender
-    from .data.sample_data import create_sample_data
+    from .database.db_loader import DatabaseLoader, HybridDataManager
 except ImportError:
     # Абсолютные импорты для прямого запуска
     from models.data_models import DataManager, User, Product, Rating
     from algorithms.knn_recommender import KNNRecommender
-    from data.sample_data import create_sample_data
+    from database.db_loader import DatabaseLoader, HybridDataManager
 
 
-class RecommendationSystem:
+class RecommendationSystemDB:
     """
-    Главный класс рекомендательной системы интернет-магазина.
+    Рекомендательная система с поддержкой базы данных.
     
-    Интегрирует управление данными, алгоритмы рекомендаций и предоставляет
-    высокоуровневый API для получения рекомендаций.
+    Интегрирует управление данными, алгоритмы рекомендаций и базу данных.
     """
     
     def __init__(self, 
+                 database_url: Optional[str] = None,
                  approach: str = 'user_based',
                  n_neighbors: int = 10,
                  metric: str = 'cosine',
-                 min_ratings: int = 5):
+                 min_ratings: int = 5,
+                 auto_load: bool = True):
         """
-        Инициализация рекомендательной системы.
+        Инициализация рекомендательной системы с БД.
         
         Args:
+            database_url: URL базы данных (если None, используется SQLite)
             approach: Подход к рекомендациям ('user_based' или 'item_based')
             n_neighbors: Количество ближайших соседей для k-NN
             metric: Метрика расстояния ('cosine', 'euclidean', 'manhattan')
             min_ratings: Минимальное количество рейтингов для учета
+            auto_load: Автоматически загружать данные и обучать модель при инициализации
         """
         self.approach = approach
         self.n_neighbors = n_neighbors
@@ -52,7 +54,7 @@ class RecommendationSystem:
         self.min_ratings = min_ratings
         
         # Компоненты системы
-        self.data_manager = DataManager()
+        self.data_manager = HybridDataManager(database_url)
         self.recommender = KNNRecommender(
             n_neighbors=n_neighbors,
             metric=metric,
@@ -68,24 +70,33 @@ class RecommendationSystem:
         self._popular_items_cache = None
         self._cache_timestamp = None
         
-    def load_data(self, users: List[User], products: List[Product], ratings: List[Rating]):
-        """
-        Загружает данные в систему.
+        # Автоматическая загрузка и обучение при инициализации
+        if auto_load:
+            self.load_data_from_db()
+            self.train_model()
         
-        Args:
-            users: Список пользователей
-            products: Список товаров
-            ratings: Список рейтингов
-        """
-        print("Загрузка данных в систему...")
+    def load_data_from_db(self):
+        """Загружает данные из базы данных."""
+        print("🗄️ Загрузка данных из базы данных...")
         
-        # Загружаем данные в менеджер
-        self.data_manager.load_users(users)
-        self.data_manager.load_products(products)
-        self.data_manager.load_ratings(ratings)
+        # Загружаем данные из БД в память
+        users, products, ratings = self.data_manager.load_initial_data()
+        
+        # Создаем традиционный DataManager для совместимости
+        self.data_manager_legacy = DataManager()
+        
+        # Конвертируем данные в формат для DataManager
+        users_data = [user.to_dict() for user in users]
+        products_data = [product.to_dict() for product in products]
+        ratings_data = [rating.to_dict() for rating in ratings]
+        
+        # Загружаем в DataManager
+        self.data_manager_legacy.load_users(users)
+        self.data_manager_legacy.load_products(products)
+        self.data_manager_legacy.load_ratings(ratings)
         
         # Валидируем данные
-        validation_results = self.data_manager.validate_data()
+        validation_results = self.data_manager_legacy.validate_data()
         if not all(validation_results.values()):
             print("Предупреждение: Обнаружены проблемы с данными:")
             for check, result in validation_results.items():
@@ -93,40 +104,23 @@ class RecommendationSystem:
                     print(f"  - {check}: FAILED")
         
         self.is_data_loaded = True
-        self.is_model_trained = False  # Нужно переобучить модель
+        self.is_model_trained = False
         self._invalidate_cache()
         
-        print(f"Данные успешно загружены:")
+        print(f"✅ Данные загружены из БД:")
         print(f"  - Пользователей: {len(users)}")
         print(f"  - Товаров: {len(products)}")
         print(f"  - Рейтингов: {len(ratings)}")
     
-    def load_sample_data(self, num_users: int = 50, num_products: int = 100, 
-                        avg_ratings_per_user: int = 15, seed: int = 42):
-        """
-        Загружает тестовые данные.
-        
-        Args:
-            num_users: Количество пользователей
-            num_products: Количество товаров
-            avg_ratings_per_user: Среднее количество рейтингов на пользователя
-            seed: Семя для генератора случайных чисел
-        """
-        print("Генерация тестовых данных...")
-        users, products, ratings = create_sample_data(
-            num_users, num_products, avg_ratings_per_user, seed
-        )
-        self.load_data(users, products, ratings)
-    
     def train_model(self):
         """Обучает модель рекомендаций."""
         if not self.is_data_loaded:
-            raise ValueError("Данные не загружены. Вызовите load_data() или load_sample_data() сначала.")
+            raise ValueError("Данные не загружены. Вызовите load_data_from_db() сначала.")
         
-        print("Начинаем обучение модели...")
+        print("🎯 Начинаем обучение модели...")
         
         # Получаем DataFrame с рейтингами
-        ratings_df = self.data_manager.ratings_df.copy()
+        ratings_df = self.data_manager_legacy.ratings_df.copy()
         
         # Обучаем рекомендательную модель
         self.recommender.fit(ratings_df)
@@ -134,11 +128,11 @@ class RecommendationSystem:
         self.is_model_trained = True
         self._invalidate_cache()
         
-        print("Модель успешно обучена!")
+        print("✅ Модель успешно обучена!")
         
         # Выводим информацию о модели
         model_info = self.recommender.get_model_info()
-        print("\nИнформация о модели:")
+        print("\n📊 Информация о модели:")
         for key, value in model_info.items():
             print(f"  - {key}: {value}")
     
@@ -171,13 +165,24 @@ class RecommendationSystem:
             
             if include_metadata:
                 try:
-                    product_info = self.data_manager.get_product_info(product_id)
-                    rec_dict.update({
-                        'name': product_info['name'],
-                        'category': product_info['category'],
-                        'price': product_info['price'],
-                        'brand': product_info.get('brand', 'Unknown')
-                    })
+                    # Получаем информацию из БД
+                    product_info = self.data_manager.get_product_from_cache(product_id)
+                    if product_info:
+                        rec_dict.update({
+                            'name': product_info.name,
+                            'category': product_info.category,
+                            'price': product_info.price,
+                            'brand': product_info.brand
+                        })
+                    else:
+                        # Fallback на legacy DataManager
+                        product_info = self.data_manager_legacy.get_product_info(product_id)
+                        rec_dict.update({
+                            'name': product_info['name'],
+                            'category': product_info['category'],
+                            'price': product_info['price'],
+                            'brand': product_info.get('brand', 'Unknown')
+                        })
                 except:
                     # Если не удалось получить информацию о товаре
                     rec_dict.update({
@@ -226,16 +231,24 @@ class RecommendationSystem:
         result = []
         for similar_user_id, similarity in similar_users:
             try:
-                user_profile = self.data_manager.get_user_profile(similar_user_id)
-                user_info = user_profile['user_info']
-                
-                result.append({
-                    'user_id': similar_user_id,
-                    'similarity': round(similarity, 3),
-                    'name': user_info['name'],
-                    'age': user_info.get('age'),
-                    'ratings_count': len(user_profile['ratings'])
-                })
+                # Получаем информацию из БД
+                user_info = self.data_manager.get_user_from_cache(similar_user_id)
+                if user_info:
+                    result.append({
+                        'user_id': similar_user_id,
+                        'similarity': round(similarity, 3),
+                        'name': user_info.name,
+                        'age': user_info.age,
+                        'ratings_count': len(self.data_manager.get_user_ratings(similar_user_id))
+                    })
+                else:
+                    result.append({
+                        'user_id': similar_user_id,
+                        'similarity': round(similarity, 3),
+                        'name': f'User {similar_user_id}',
+                        'age': None,
+                        'ratings_count': 0
+                    })
             except:
                 result.append({
                     'user_id': similar_user_id,
@@ -266,16 +279,26 @@ class RecommendationSystem:
         result = []
         for similar_product_id, similarity in similar_items:
             try:
-                product_info = self.data_manager.get_product_info(similar_product_id)
-                
-                result.append({
-                    'product_id': similar_product_id,
-                    'similarity': round(similarity, 3),
-                    'name': product_info['name'],
-                    'category': product_info['category'],
-                    'price': product_info['price'],
-                    'brand': product_info.get('brand', 'Unknown')
-                })
+                # Получаем информацию из БД
+                product_info = self.data_manager.get_product_from_cache(similar_product_id)
+                if product_info:
+                    result.append({
+                        'product_id': similar_product_id,
+                        'similarity': round(similarity, 3),
+                        'name': product_info.name,
+                        'category': product_info.category,
+                        'price': product_info.price,
+                        'brand': product_info.brand
+                    })
+                else:
+                    result.append({
+                        'product_id': similar_product_id,
+                        'similarity': round(similarity, 3),
+                        'name': f'Product {similar_product_id}',
+                        'category': 'Unknown',
+                        'price': 0.0,
+                        'brand': 'Unknown'
+                    })
             except:
                 result.append({
                     'product_id': similar_product_id,
@@ -308,7 +331,7 @@ class RecommendationSystem:
             return self._popular_items_cache[:n_items]
         
         # Получаем популярные товары
-        popular_items = self.data_manager.get_popular_products(n_items)
+        popular_items = self.data_manager_legacy.get_popular_products(n_items)
         
         # Кэшируем результат
         self._popular_items_cache = popular_items
@@ -329,12 +352,12 @@ class RecommendationSystem:
         if not self.is_data_loaded:
             raise ValueError("Данные не загружены.")
         
-        return self.data_manager.get_user_profile(user_id)
+        return self.data_manager_legacy.get_user_profile(user_id)
     
     def add_rating(self, user_id: int, product_id: int, rating: float, 
                    review: Optional[str] = None):
         """
-        Добавляет новый рейтинг.
+        Добавляет новый рейтинг в БД и обновляет кэш.
         
         Args:
             user_id: ID пользователя
@@ -357,10 +380,13 @@ class RecommendationSystem:
             review=review
         )
         
-        # Добавляем к существующим данным
+        # Добавляем в БД и кэш
+        rating_id = self.data_manager.add_rating(new_rating)
+        
+        # Обновляем legacy DataManager
         new_rating_df = pd.DataFrame([new_rating.to_dict()])
-        self.data_manager.ratings_df = pd.concat([
-            self.data_manager.ratings_df, 
+        self.data_manager_legacy.ratings_df = pd.concat([
+            self.data_manager_legacy.ratings_df, 
             new_rating_df
         ], ignore_index=True)
         
@@ -368,7 +394,108 @@ class RecommendationSystem:
         self.is_model_trained = False
         self._invalidate_cache()
         
-        print(f"Рейтинг добавлен: пользователь {user_id}, товар {product_id}, рейтинг {rating}")
+        print(f"✅ Рейтинг добавлен в БД: пользователь {user_id}, товар {product_id}, рейтинг {rating}")
+        return rating_id
+    
+    def add_product(self, product: Product):
+        """
+        Добавляет новый товар в БД и обновляет кэш.
+        
+        Args:
+            product: Объект товара
+        """
+        if not self.is_data_loaded:
+            raise ValueError("Данные не загружены.")
+        
+        # Добавляем в БД и кэш
+        product_id = self.data_manager.add_product(product)
+        
+        # Обновляем legacy DataManager
+        new_product_df = pd.DataFrame([product.to_dict()])
+        self.data_manager_legacy.products_df = pd.concat([
+            self.data_manager_legacy.products_df, 
+            new_product_df
+        ], ignore_index=True)
+        
+        # Помечаем, что модель нужно переобучить
+        self.is_model_trained = False
+        self._invalidate_cache()
+        
+        print(f"✅ Товар добавлен в БД: {product.name} (ID: {product.product_id})")
+        return product_id
+    
+    def add_user(self, user: User):
+        """
+        Добавляет нового пользователя в БД и обновляет кэш.
+        
+        Args:
+            user: Объект пользователя
+        """
+        if not self.is_data_loaded:
+            raise ValueError("Данные не загружены.")
+        
+        # Добавляем в БД и кэш
+        user_id = self.data_manager.add_user(user)
+        
+        # Обновляем legacy DataManager
+        new_user_df = pd.DataFrame([user.to_dict()])
+        self.data_manager_legacy.users_df = pd.concat([
+            self.data_manager_legacy.users_df, 
+            new_user_df
+        ], ignore_index=True)
+        
+        # Помечаем, что модель нужно переобучить
+        self.is_model_trained = False
+        self._invalidate_cache()
+        
+        print(f"✅ Пользователь добавлен в БД: {user.name} (ID: {user.user_id})")
+        return user_id
+    
+    def retrain_model(self):
+        """
+        Переобучает модель с учетом новых данных.
+        
+        Returns:
+            bool: True если переобучение прошло успешно
+        """
+        if not self.is_data_loaded:
+            raise ValueError("Данные не загружены.")
+        
+        try:
+            print("🔄 Начинаем переобучение модели...")
+            
+            # Обновляем кэш из БД
+            self.data_manager.refresh_cache()
+            
+            # Загружаем обновленные данные
+            users, products, ratings = self.data_manager.load_initial_data()
+            
+            # Обновляем legacy DataManager
+            self.data_manager_legacy.load_users(users)
+            self.data_manager_legacy.load_products(products)
+            self.data_manager_legacy.load_ratings(ratings)
+            
+            # Переобучаем модель
+            ratings_df = self.data_manager_legacy.ratings_df.copy()
+            self.recommender.fit(ratings_df)
+            
+            self.is_model_trained = True
+            self._invalidate_cache()
+            
+            print("✅ Модель успешно переобучена!")
+            
+            # Выводим информацию о модели
+            model_info = self.recommender.get_model_info()
+            print("\n📊 Информация о переобученной модели:")
+            for key, value in model_info.items():
+                print(f"  - {key}: {value}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Ошибка при переобучении модели: {e}")
+            self.is_model_trained = False
+            return False
     
     def get_system_stats(self) -> Dict:
         """
@@ -380,20 +507,21 @@ class RecommendationSystem:
         if not self.is_data_loaded:
             return {"status": "Данные не загружены"}
         
+        # Получаем статистику из БД
+        db_stats = self.data_manager.get_stats()
+        
         stats = {
             "data_loaded": self.is_data_loaded,
             "model_trained": self.is_model_trained,
             "approach": self.approach,
             "n_neighbors": self.n_neighbors,
             "metric": self.metric,
-            "users_count": len(self.data_manager.users_df) if self.data_manager.users_df is not None else 0,
-            "products_count": len(self.data_manager.products_df) if self.data_manager.products_df is not None else 0,
-            "ratings_count": len(self.data_manager.ratings_df) if self.data_manager.ratings_df is not None else 0
+            **db_stats
         }
         
         # Добавляем статистику пользователей
         if self.is_data_loaded:
-            user_stats = self.data_manager.get_user_statistics()
+            user_stats = self.data_manager_legacy.get_user_statistics()
             stats.update(user_stats)
         
         # Добавляем информацию о модели
@@ -403,58 +531,6 @@ class RecommendationSystem:
         
         return stats
     
-    def save_model(self, filepath: str):
-        """
-        Сохраняет обученную модель.
-        
-        Args:
-            filepath: Путь для сохранения модели
-        """
-        if not self.is_model_trained:
-            raise ValueError("Модель не обучена.")
-        
-        model_data = {
-            'recommender': self.recommender,
-            'data_manager': self.data_manager,
-            'approach': self.approach,
-            'n_neighbors': self.n_neighbors,
-            'metric': self.metric,
-            'min_ratings': self.min_ratings,
-            'is_data_loaded': self.is_data_loaded,
-            'is_model_trained': self.is_model_trained
-        }
-        
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
-        
-        print(f"Модель сохранена в {filepath}")
-    
-    def load_model(self, filepath: str):
-        """
-        Загружает сохраненную модель.
-        
-        Args:
-            filepath: Путь к файлу модели
-        """
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Файл модели не найден: {filepath}")
-        
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
-        
-        self.recommender = model_data['recommender']
-        self.data_manager = model_data['data_manager']
-        self.approach = model_data['approach']
-        self.n_neighbors = model_data['n_neighbors']
-        self.metric = model_data['metric']
-        self.min_ratings = model_data['min_ratings']
-        self.is_data_loaded = model_data['is_data_loaded']
-        self.is_model_trained = model_data['is_model_trained']
-        
-        self._invalidate_cache()
-        
-        print(f"Модель загружена из {filepath}")
-    
     def _invalidate_cache(self):
         """Очищает кэш."""
         self._popular_items_cache = None
@@ -463,47 +539,62 @@ class RecommendationSystem:
     def __repr__(self):
         """Строковое представление системы."""
         status = "trained" if self.is_model_trained else "not trained"
-        return (f"RecommendationSystem(approach='{self.approach}', "
+        return (f"RecommendationSystemDB(approach='{self.approach}', "
                 f"n_neighbors={self.n_neighbors}, metric='{self.metric}', "
                 f"status='{status}')")
 
 
-# Удобная функция для быстрого создания системы с тестовыми данными
-def create_demo_system(approach: str = 'user_based', 
-                      n_neighbors: int = 10,
-                      num_users: int = 50, 
-                      num_products: int = 100,
-                      seed: int = 42) -> RecommendationSystem:
+def create_db_system(database_url: Optional[str] = None,
+                     approach: str = 'user_based', 
+                     n_neighbors: int = 10) -> RecommendationSystemDB:
     """
-    Создает демонстрационную рекомендательную систему с тестовыми данными.
+    Создает рекомендательную систему с базой данных.
     
     Args:
+        database_url: URL базы данных (если None, используется SQLite)
         approach: Подход к рекомендациям ('user_based' или 'item_based')
         n_neighbors: Количество ближайших соседей
-        num_users: Количество пользователей
-        num_products: Количество товаров
-        seed: Семя для генератора случайных чисел
         
     Returns:
-        Обученная рекомендательная система
+        Обученная рекомендательная система с БД
     """
-    print("Создание демонстрационной рекомендательной системы...")
+    print("🏗️ Создание рекомендательной системы с базой данных...")
     
     # Создаем систему
-    system = RecommendationSystem(
+    system = RecommendationSystemDB(
+        database_url=database_url,
         approach=approach,
         n_neighbors=n_neighbors
     )
     
-    # Загружаем тестовые данные
-    system.load_sample_data(
-        num_users=num_users,
-        num_products=num_products,
-        seed=seed
-    )
+    # Загружаем данные из БД
+    system.load_data_from_db()
     
     # Обучаем модель
     system.train_model()
     
-    print("Демонстрационная система готова к использованию!")
+    print("✅ Система с базой данных готова к использованию!")
     return system
+
+
+if __name__ == '__main__':
+    # Пример использования
+    print("🚀 ДЕМОНСТРАЦИЯ РЕКОМЕНДАТЕЛЬНОЙ СИСТЕМЫ С БАЗОЙ ДАННЫХ")
+    print("="*60)
+    
+    # Создаем систему
+    system = create_db_system()
+    
+    # Выводим статистику
+    stats = system.get_system_stats()
+    print(f"\n📊 Статистика системы:")
+    for key, value in stats.items():
+        print(f"  - {key}: {value}")
+    
+    # Получаем рекомендации
+    print(f"\n🎯 Рекомендации для пользователя 1:")
+    recommendations = system.get_recommendations(user_id=1, n_recommendations=5)
+    for i, rec in enumerate(recommendations, 1):
+        print(f"  {i}. {rec['name']} ({rec['category']}) - рейтинг: {rec['predicted_rating']}")
+    
+    print("\n🎉 Демонстрация завершена!")

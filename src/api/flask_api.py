@@ -1,8 +1,8 @@
 """
-Flask API для рекомендательной системы интернет-магазина.
+Flask API для рекомендательной системы с базой данных.
 
 Этот модуль предоставляет RESTful API для получения рекомендаций,
-управления рейтингами и получения информации о системе.
+управления рейтингами и работы с базой данных.
 """
 
 from flask import Flask, request, jsonify
@@ -11,30 +11,33 @@ from typing import Dict, Any, Optional
 import traceback
 import os
 import sys
+from datetime import datetime
 
 # Добавляем путь к src в PYTHONPATH
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from recommendation_system import RecommendationSystem, create_demo_system
+from recommendation_system import RecommendationSystemDB, create_db_system
 
 
-class RecommendationAPI:
-    """API класс для рекомендательной системы."""
+class RecommendationAPIDB:
+    """API класс для рекомендательной системы с базой данных."""
     
-    def __init__(self, recommendation_system: Optional[RecommendationSystem] = None):
+    def __init__(self, recommendation_system: Optional[RecommendationSystemDB] = None,
+                 database_url: Optional[str] = None):
         """
         Инициализация API.
         
         Args:
             recommendation_system: Экземпляр рекомендательной системы
+            database_url: URL базы данных
         """
         self.app = Flask(__name__)
         CORS(self.app)  # Разрешаем CORS для всех доменов
         
         # Инициализируем рекомендательную систему
         if recommendation_system is None:
-            print("Создание демонстрационной рекомендательной системы...")
-            self.rec_system = create_demo_system()
+            print("Создание рекомендательной системы с базой данных...")
+            self.rec_system = create_db_system(database_url)
         else:
             self.rec_system = recommendation_system
         
@@ -51,19 +54,25 @@ class RecommendationAPI:
         def index():
             """Главная страница API."""
             return jsonify({
-                "message": "Рекомендательная система интернет-магазина",
-                "version": "1.0.0",
+                "message": "Рекомендательная система с базой данных",
+                "version": "2.0.0",
+                "database": "SQLite/PostgreSQL",
                 "endpoints": {
                     "GET /": "Информация об API",
                     "GET /health": "Проверка состояния системы",
                     "GET /stats": "Статистика системы",
+                    "GET /db-stats": "Статистика базы данных",
                     "GET /users/<user_id>/recommendations": "Рекомендации для пользователя",
                     "GET /users/<user_id>/similar": "Похожие пользователи",
                     "GET /users/<user_id>/profile": "Профиль пользователя",
                     "GET /products/<product_id>/similar": "Похожие товары",
                     "GET /products/popular": "Популярные товары",
                     "POST /ratings": "Добавить рейтинг",
-                    "POST /predict": "Предсказать рейтинг"
+                    "POST /products": "Добавить товар",
+                    "POST /users": "Добавить пользователя",
+                    "POST /retrain": "Переобучить модель",
+                    "POST /ratings/batch": "Добавить несколько рейтингов",
+                    "POST /products/batch": "Добавить несколько товаров"
                 }
             })
         
@@ -76,6 +85,7 @@ class RecommendationAPI:
                     "status": "healthy",
                     "data_loaded": stats.get("data_loaded", False),
                     "model_trained": stats.get("model_trained", False),
+                    "database_connected": True,
                     "timestamp": stats.get("timestamp", None)
                 })
             except Exception as e:
@@ -89,9 +99,40 @@ class RecommendationAPI:
             """Получает статистику системы."""
             try:
                 stats = self.rec_system.get_system_stats()
+                
+                # Конвертируем numpy типы в Python типы для JSON сериализации
+                def convert_numpy_types(obj):
+                    if hasattr(obj, 'item'):  # numpy scalar
+                        return obj.item()
+                    elif hasattr(obj, 'tolist'):  # numpy array
+                        return obj.tolist()
+                    elif isinstance(obj, dict):
+                        return {k: convert_numpy_types(v) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [convert_numpy_types(v) for v in obj]
+                    else:
+                        return obj
+                
+                stats = convert_numpy_types(stats)
+                
                 return jsonify({
                     "success": True,
                     "data": stats
+                })
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 500
+        
+        @self.app.route('/db-stats', methods=['GET'])
+        def get_db_stats():
+            """Получает статистику базы данных."""
+            try:
+                db_stats = self.rec_system.data_manager.get_database_stats()
+                return jsonify({
+                    "success": True,
+                    "data": db_stats
                 })
             except Exception as e:
                 return jsonify({
@@ -271,7 +312,7 @@ class RecommendationAPI:
         @self.app.route('/ratings', methods=['POST'])
         def add_rating():
             """
-            Добавляет новый рейтинг.
+            Добавляет новый рейтинг в базу данных.
             
             JSON параметры:
             - user_id (int): ID пользователя
@@ -321,7 +362,8 @@ class RecommendationAPI:
                         "error": "rating должно быть числом от 1 до 5"
                     }), 400
                 
-                self.rec_system.add_rating(
+                # Добавляем рейтинг в БД
+                rating_id = self.rec_system.add_rating(
                     user_id=user_id,
                     product_id=product_id,
                     rating=float(rating),
@@ -330,7 +372,8 @@ class RecommendationAPI:
                 
                 return jsonify({
                     "success": True,
-                    "message": "Рейтинг успешно добавлен",
+                    "message": "Рейтинг успешно добавлен в базу данных",
+                    "rating_id": rating_id,
                     "data": {
                         "user_id": user_id,
                         "product_id": product_id,
@@ -345,14 +388,19 @@ class RecommendationAPI:
                     "error": str(e)
                 }), 500
         
-        @self.app.route('/predict', methods=['POST'])
-        def predict_rating():
+        @self.app.route('/products', methods=['POST'])
+        def add_product():
             """
-            Предсказывает рейтинг пользователя для товара.
+            Добавляет новый товар в базу данных.
             
             JSON параметры:
-            - user_id (int): ID пользователя
             - product_id (int): ID товара
+            - name (str): Название товара
+            - category (str): Категория товара
+            - price (float): Цена товара
+            - description (str, optional): Описание товара
+            - brand (str, optional): Бренд товара
+            - in_stock (bool, optional): Наличие на складе (по умолчанию true)
             """
             try:
                 data = request.get_json()
@@ -364,7 +412,7 @@ class RecommendationAPI:
                     }), 400
                 
                 # Валидация обязательных полей
-                required_fields = ['user_id', 'product_id']
+                required_fields = ['product_id', 'name', 'category', 'price']
                 for field in required_fields:
                     if field not in data:
                         return jsonify({
@@ -372,29 +420,240 @@ class RecommendationAPI:
                             "error": f"Обязательное поле отсутствует: {field}"
                         }), 400
                 
-                user_id = data['user_id']
-                product_id = data['product_id']
+                # Импортируем Product здесь, чтобы избежать циклических импортов
+                from models.data_models import Product
                 
-                # Валидация типов
-                if not isinstance(user_id, int) or user_id <= 0:
-                    return jsonify({
-                        "success": False,
-                        "error": "user_id должно быть положительным целым числом"
-                    }), 400
+                # Создаем новый товар
+                new_product = Product(
+                    product_id=data['product_id'],
+                    name=data['name'],
+                    category=data['category'],
+                    price=float(data['price']),
+                    description=data.get('description', ''),
+                    brand=data.get('brand', 'Unknown'),
+                    in_stock=data.get('in_stock', True)
+                )
                 
-                if not isinstance(product_id, int) or product_id <= 0:
-                    return jsonify({
-                        "success": False,
-                        "error": "product_id должно быть положительным целым числом"
-                    }), 400
-                
-                predicted_rating = self.rec_system.predict_rating(user_id, product_id)
+                # Добавляем товар в БД
+                product_id = self.rec_system.add_product(new_product)
                 
                 return jsonify({
                     "success": True,
-                    "user_id": user_id,
+                    "message": "Товар успешно добавлен в базу данных",
                     "product_id": product_id,
-                    "predicted_rating": round(predicted_rating, 2)
+                    "data": {
+                        "product_id": new_product.product_id,
+                        "name": new_product.name,
+                        "category": new_product.category,
+                        "price": new_product.price
+                    }
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 500
+        
+        @self.app.route('/users', methods=['POST'])
+        def add_user():
+            """
+            Добавляет нового пользователя в базу данных.
+            
+            JSON параметры:
+            - user_id (int): ID пользователя
+            - name (str): Имя пользователя
+            - email (str): Email пользователя
+            - age (int, optional): Возраст пользователя
+            - gender (str, optional): Пол пользователя
+            """
+            try:
+                data = request.get_json()
+                
+                if not data:
+                    return jsonify({
+                        "success": False,
+                        "error": "Требуется JSON данные"
+                    }), 400
+                
+                # Валидация обязательных полей
+                required_fields = ['user_id', 'name', 'email']
+                for field in required_fields:
+                    if field not in data:
+                        return jsonify({
+                            "success": False,
+                            "error": f"Обязательное поле отсутствует: {field}"
+                        }), 400
+                
+                # Импортируем User здесь, чтобы избежать циклических импортов
+                from models.data_models import User
+                
+                # Создаем нового пользователя
+                new_user = User(
+                    user_id=data['user_id'],
+                    name=data['name'],
+                    email=data['email'],
+                    age=data.get('age', 25),
+                    gender=data.get('gender', 'М'),
+                    registration_date=datetime.now()
+                )
+                
+                # Добавляем пользователя в БД
+                user_id = self.rec_system.add_user(new_user)
+                
+                return jsonify({
+                    "success": True,
+                    "message": "Пользователь успешно добавлен в базу данных",
+                    "user_id": user_id,
+                    "data": {
+                        "user_id": new_user.user_id,
+                        "name": new_user.name,
+                        "email": new_user.email,
+                        "age": new_user.age
+                    }
+                })
+                
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 500
+        
+        @self.app.route('/retrain', methods=['POST'])
+        def retrain_model():
+            """
+            Переобучает модель с учетом новых данных из БД.
+            
+            Query параметры:
+            - force (bool): Принудительное переобучение даже если модель уже обучена
+            - async (bool): Асинхронное переобучение (возвращает статус без ожидания)
+            """
+            try:
+                force = request.args.get('force', 'false').lower() == 'true'
+                async_mode = request.args.get('async', 'false').lower() == 'true'
+                
+                # Проверяем, нужно ли переобучение
+                if not force and self.rec_system.is_model_trained:
+                    return jsonify({
+                        "success": True,
+                        "message": "Модель уже обучена. Используйте force=true для принудительного переобучения.",
+                        "model_trained": True
+                    })
+                
+                if async_mode:
+                    # Асинхронное переобучение - запускаем в фоне и возвращаем статус
+                    import threading
+                    
+                    def retrain_background():
+                        try:
+                            self.rec_system.retrain_model()
+                        except Exception as e:
+                            print(f"Ошибка при асинхронном переобучении: {e}")
+                    
+                    thread = threading.Thread(target=retrain_background)
+                    thread.daemon = True
+                    thread.start()
+                    
+                    return jsonify({
+                        "success": True,
+                        "message": "Переобучение запущено в фоновом режиме",
+                        "status": "retraining_in_progress",
+                        "model_trained": False
+                    })
+                else:
+                    # Синхронное переобучение
+                    print("Начинаем синхронное переобучение модели...")
+                    success = self.rec_system.retrain_model()
+                    
+                    if success:
+                        stats = self.rec_system.get_system_stats()
+                        
+                        # Конвертируем numpy типы в Python типы для JSON сериализации
+                        def convert_numpy_types(obj):
+                            if hasattr(obj, 'item'):  # numpy scalar
+                                return obj.item()
+                            elif hasattr(obj, 'tolist'):  # numpy array
+                                return obj.tolist()
+                            elif isinstance(obj, dict):
+                                return {k: convert_numpy_types(v) for k, v in obj.items()}
+                            elif isinstance(obj, list):
+                                return [convert_numpy_types(v) for v in obj]
+                            else:
+                                return obj
+                        
+                        stats = convert_numpy_types(stats)
+                        
+                        return jsonify({
+                            "success": True,
+                            "message": "Модель успешно переобучена с данными из БД",
+                            "model_trained": True,
+                            "stats": stats
+                        })
+                    else:
+                        return jsonify({
+                            "success": False,
+                            "error": "Ошибка при переобучении модели"
+                        }), 500
+                
+            except Exception as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 500
+        
+        @self.app.route('/ratings/batch', methods=['POST'])
+        def batch_add_ratings():
+            """
+            Добавляет несколько рейтингов одновременно в базу данных.
+            
+            JSON параметры:
+            - ratings (array): Массив объектов рейтингов
+            """
+            try:
+                data = request.get_json()
+                
+                if not data or 'ratings' not in data:
+                    return jsonify({
+                        "success": False,
+                        "error": "Требуется массив ratings в JSON данных"
+                    }), 400
+                
+                ratings_data = data['ratings']
+                if not isinstance(ratings_data, list):
+                    return jsonify({
+                        "success": False,
+                        "error": "ratings должен быть массивом"
+                    }), 400
+                
+                # Валидируем и добавляем рейтинги
+                added_count = 0
+                for i, rating_data in enumerate(ratings_data):
+                    required_fields = ['user_id', 'product_id', 'rating']
+                    for field in required_fields:
+                        if field not in rating_data:
+                            return jsonify({
+                                "success": False,
+                                "error": f"Обязательное поле {field} отсутствует в рейтинге {i}"
+                            }), 400
+                    
+                    try:
+                        self.rec_system.add_rating(
+                            user_id=rating_data['user_id'],
+                            product_id=rating_data['product_id'],
+                            rating=float(rating_data['rating']),
+                            review=rating_data.get('review')
+                        )
+                        added_count += 1
+                    except Exception as e:
+                        return jsonify({
+                            "success": False,
+                            "error": f"Ошибка при добавлении рейтинга {i}: {e}"
+                        }), 500
+                
+                return jsonify({
+                    "success": True,
+                    "message": f"Добавлено {added_count} рейтингов в базу данных",
+                    "count": added_count
                 })
                 
             except Exception as e:
@@ -438,7 +697,7 @@ class RecommendationAPI:
                 "code": 500
             }), 500
     
-    def run(self, host: str = '0.0.0.0', port: int = 3001, debug: bool = False):
+    def run(self, host: str = '0.0.0.0', port: int = 3002, debug: bool = False):
         """
         Запускает Flask сервер.
         
@@ -447,38 +706,28 @@ class RecommendationAPI:
             port: Порт для привязки
             debug: Режим отладки
         """
-        print(f"Запуск API сервера на {host}:{port}")
+        print(f"Запуск API сервера с базой данных на {host}:{port}")
         print(f"Документация доступна по адресу: http://{host}:{port}/")
         self.app.run(host=host, port=port, debug=debug)
 
 
-def create_api(recommendation_system: Optional[RecommendationSystem] = None) -> RecommendationAPI:
+def create_api_db(database_url: Optional[str] = None) -> RecommendationAPIDB:
     """
-    Создает экземпляр API.
+    Создает экземпляр API с базой данных.
     
     Args:
-        recommendation_system: Экземпляр рекомендательной системы
+        database_url: URL базы данных
         
     Returns:
-        Экземпляр RecommendationAPI
+        Экземпляр RecommendationAPIDB
     """
-    return RecommendationAPI(recommendation_system)
+    return RecommendationAPIDB(database_url=database_url)
 
 
 # Пример использования
 if __name__ == '__main__':
-    # Создаем демонстрационную систему
-    print("Создание демонстрационной рекомендательной системы...")
-    demo_system = create_demo_system(
-        approach='user_based',
-        n_neighbors=10,
-        num_users=50,
-        num_products=100,
-        seed=42
-    )
-    
-    # Создаем API
-    api = create_api(demo_system)
+    # Создаем API с базой данных
+    api = create_api_db()
     
     # Запускаем сервер
     api.run(debug=True)
